@@ -5,3 +5,4 @@
 azure-functions
 requests
 beautifulsoup4
+azure-storage-blob==12.20.0

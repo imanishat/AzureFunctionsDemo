@@ -37,13 +37,9 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
         account_key = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
         container_name = os.environ.get("AZURE_STORAGE_CONTAINER_NAME")
 
-        if not account_name or not account_key or not container_name:
-            raise ValueError("Missing required Azure Storage configuration")
+        blob_connection_str = f"DefaultEndpointsProtocol=https;AccountName={account_name};AccountKey={account_key};EndpointSuffix=core.windows.net"
 
-        blob_service_client = BlobServiceClient(
-            account_url=f"https://{account_name}.blob.core.windows.net",
-            credential=account_key
-        )
+        blob_service_client = BlobServiceClient.from_connection_string(blob_connection_str)
         blob_container_client = blob_service_client.get_container_client(container_name)
 
         downloaded_files = []
