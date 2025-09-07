@@ -71,9 +71,17 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
         if not account_name or not container_name:
             raise ValueError("Missing required Azure Storage configuration")
 
-        # Use DefaultAzureCredential for managed identity authentication
-        credential = DefaultAzureCredential()
-
+        # Use different authentication based on environment
+        if os.environ.get("WEBSITE_SITE_NAME"):  # Running in Azure
+            logging.info("Running in Azure - using managed identity")
+            # Use managed identity in Azure
+            credential = DefaultAzureCredential()
+        else:
+            logging.info("Running locally - using Azure CLI credentials")
+            # Use Azure CLI credentials for local development
+            from azure.identity import AzureCliCredential
+            credential = AzureCliCredential()
+        
         blob_service_client = BlobServiceClient(
             account_url=f"https://{account_name}.blob.core.windows.net",
             credential=credential
