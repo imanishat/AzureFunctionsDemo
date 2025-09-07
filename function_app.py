@@ -16,7 +16,7 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Function triggered to crawl and upload all PDF and Word document files to Blob Storage.')
 
     # Config
-    target_url = 'https://www.sca.gov.ae/en/regulations/circulars-and-procedures.aspx'
+    target_url = 'https://rulebook.centralbank.ae/en'
     max_pages_to_crawl = 10
     max_depth = 2
 
