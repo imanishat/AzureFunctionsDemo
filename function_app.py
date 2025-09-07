@@ -8,41 +8,75 @@ from urllib.parse import urljoin, urlparse
 from collections import deque
 import hashlib
 from azure.storage.blob import BlobServiceClient
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+def get_secret_from_keyvault(secret_name: str) -> str:
+    """Get secret from Azure Key Vault with fallback to environment variables"""
+    try:
+        # For Azure deployment, try Key Vault first
+        if os.environ.get("WEBSITE_SITE_NAME"):  # Running in Azure
+            vault_url = "https://kv-agenticai-demo.vault.azure.net/"
+            credential = DefaultAzureCredential()
+            client = SecretClient(vault_url=vault_url, credential=credential)
+            secret = client.get_secret(secret_name)
+            return secret.value
+        else:
+            # For local development, use environment variables
+            env_map = {
+                "AzureStorageAccountName": "AZURE_STORAGE_ACCOUNT_NAME",
+                "AzureStorageAccountKey": "AZURE_STORAGE_ACCOUNT_KEY", 
+                "AzureStorageContainerName": "AZURE_STORAGE_CONTAINER_NAME",
+                "TargetUrl": "TARGET_URL"
+            }
+            return os.environ.get(env_map.get(secret_name, secret_name))
+    except Exception as e:
+        logging.error(f"Error retrieving secret {secret_name}: {str(e)}")
+        # Fallback to environment variable
+        env_map = {
+            "AzureStorageAccountName": "AZURE_STORAGE_ACCOUNT_NAME",
+            "AzureStorageAccountKey": "AZURE_STORAGE_ACCOUNT_KEY", 
+            "AzureStorageContainerName": "AZURE_STORAGE_CONTAINER_NAME",
+            "TargetUrl": "TARGET_URL"
+        }
+        return os.environ.get(env_map.get(secret_name, secret_name))
 
 @app.route(route="download_multiple_files")
 def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Function triggered to crawl and upload all PDF and Word document files to Blob Storage.')
 
-    # Config
-    target_url = 'https://rulebook.centralbank.ae/en'
-    max_pages_to_crawl = 10
-    max_depth = 2
-
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-    })
-
     try:
+        # Get configuration from Key Vault
+        target_url = get_secret_from_keyvault("TargetUrl") or 'https://rulebook.centralbank.ae/en'
+        max_pages_to_crawl = 10
+        max_depth = 2
+
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        })
+
         base_domain = urlparse(target_url).netloc
         urls_to_visit = deque([(target_url, 0)])
         visited_urls = set()
         all_document_links = []
         crawl_summary = []
 
-        # Azure Blob Setup
-        account_name = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
-        account_key = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
-        container_name = os.environ.get("AZURE_STORAGE_CONTAINER_NAME")
+        # Azure Blob Setup - Get credentials from Key Vault and use managed identity
+        account_name = get_secret_from_keyvault("AzureStorageAccountName")
+        container_name = get_secret_from_keyvault("AzureStorageContainerName")
 
-        if not account_name or not account_key or not container_name:
+        if not account_name or not container_name:
             raise ValueError("Missing required Azure Storage configuration")
+
+        # Use DefaultAzureCredential for managed identity authentication
+        credential = DefaultAzureCredential()
 
         blob_service_client = BlobServiceClient(
             account_url=f"https://{account_name}.blob.core.windows.net",
-            credential=account_key
+            credential=credential
         )
         blob_container_client = blob_service_client.get_container_client(container_name)
 
