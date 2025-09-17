@@ -50,8 +50,8 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
     try:
         # Get configuration from Key Vault
         target_url = get_secret_from_keyvault("TargetUrl") or 'https://rulebook.centralbank.ae/en'
-        max_pages_to_crawl = 10
-        max_depth = 2
+        max_pages_to_crawl = 10  # Increased from 10 to crawl much more extensively
+        max_depth = 2  # Increased from 2 to go much deeper
 
         session = requests.Session()
         session.headers.update({
