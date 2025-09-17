@@ -7,6 +7,7 @@ import time
 from urllib.parse import urljoin, urlparse
 from collections import deque
 import hashlib
+from datetime import datetime
 from azure.storage.blob import BlobServiceClient
 from azure.keyvault.secrets import SecretClient
 from azure.identity import DefaultAzureCredential
@@ -88,9 +89,41 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
         )
         blob_container_client = blob_service_client.get_container_client(container_name)
 
+        # Function to check if documents already exist for today
+        def check_existing_documents_for_today():
+            """Check if documents with today's date prefix already exist in storage"""
+            current_date = datetime.now()
+            date_prefix = current_date.strftime("%d%m%Y")
+            existing_files = []
+            
+            try:
+                # List all blobs in the container
+                blob_list = blob_container_client.list_blobs()
+                for blob in blob_list:
+                    # Check if blob name starts with today's date prefix
+                    blob_name = blob.name.split('/')[-1]  # Get filename from path
+                    if blob_name.startswith(date_prefix):
+                        existing_files.append({
+                            'name': blob_name,
+                            'path': blob.name,
+                            'size': blob.size,
+                            'last_modified': blob.last_modified
+                        })
+                        
+                logging.info(f"Found {len(existing_files)} documents already uploaded today ({date_prefix})")
+                return existing_files
+                
+            except Exception as e:
+                logging.error(f"Error checking existing documents: {str(e)}")
+                return []
+
+        # Check for existing documents uploaded today
+        existing_today_files = check_existing_documents_for_today()
+
         downloaded_files = []
         failed_downloads = []
         uploaded_hashes = set()
+        skipped_files = []
 
         logging.info(f"Starting crawl at {target_url}")
 
@@ -175,12 +208,55 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
                     content_hash = hashlib.sha256(response.content).hexdigest()
                     if content_hash in uploaded_hashes:
                         continue
-                    uploaded_hashes.add(content_hash)
-
+                    
                     ext = ".pdf" if doc_info['type'] == 'PDF' else (".docx" if 'docx' in download_url else ".doc")
-                    timestamp = int(time.time())
+                    
+                    # Generate unique ID with current date (ddmmyyyy) + unique timestamp
+                    current_date = datetime.now()
+                    date_prefix = current_date.strftime("%d%m%Y")
+                    unique_id = int(time.time() * 1000)  # More unique with milliseconds
+                    unique_prefix = f"{date_prefix}{unique_id}"
+                    
                     safe_text = ''.join(c for c in doc_info['text'][:50] if c.isalnum() or c in ' -_').strip().replace(' ', '_')
-                    filename = f"{safe_text}_{timestamp}_{i+1}{ext}" if safe_text else f"document_{timestamp}_{i+1}{ext}"
+                    
+                    if safe_text:
+                        filename = f"{unique_prefix}_{safe_text}{ext}"
+                    else:
+                        filename = f"{unique_prefix}_document_{i+1}{ext}"
+                    
+                    # Check if similar document already exists today
+                    document_exists = False
+                    existing_doc_name = None
+                    
+                    for existing_file in existing_today_files:
+                        # Check if document with similar name already exists today
+                        existing_name = existing_file['name']
+                        # Extract the document name part (after date prefix and underscore)
+                        if '_' in existing_name:
+                            existing_doc_part = '_'.join(existing_name.split('_')[1:])  # Get part after first underscore
+                            current_doc_part = '_'.join(filename.split('_')[1:])  # Get part after first underscore
+                            
+                            if existing_doc_part == current_doc_part:
+                                document_exists = True
+                                existing_doc_name = existing_name
+                                break
+                    
+                    if document_exists:
+                        # Document already exists today - skip upload
+                        skipped_files.append({
+                            'filename': filename,
+                            'existing_file': existing_doc_name,
+                            'size': len(response.content),
+                            'url': download_url,
+                            'text': doc_info['text'],
+                            'type': doc_info['type'],
+                            'source_page': doc_info['source_page'],
+                            'reason': f'Document already uploaded today as {existing_doc_name}'
+                        })
+                        logging.info(f"Skipping {filename} - already exists as {existing_doc_name}")
+                        continue
+                    
+                    uploaded_hashes.add(content_hash)
                     blob_path = f"{doc_info['type'].lower()}s/{filename}"
 
                     blob_container_client.upload_blob(
@@ -223,10 +299,18 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
         response_text += f"📄 Pages crawled: {len(visited_urls)}\n"
         response_text += f"📋 Documents discovered: {len(all_document_links)}\n"
         response_text += f"✅ Successfully uploaded: {len(downloaded_files)} files\n"
+        response_text += f"⏭️ Skipped (already exist today): {len(skipped_files)} files\n"
         response_text += f"❌ Failed uploads: {len(failed_downloads)} files\n\n"
 
+        # Show existing files information
+        if existing_today_files:
+            response_text += f"📅 Files already uploaded today ({datetime.now().strftime('%d/%m/%Y')}):\n"
+            for existing_file in existing_today_files:
+                response_text += f"  📄 {existing_file['name']} ({existing_file['size']:,} bytes)\n"
+            response_text += "\n"
+
         if downloaded_files:
-            response_text += "📁 Uploaded Files:\n"
+            response_text += "📁 Newly Uploaded Files:\n"
             total_size = 0
             pdf_count = sum(1 for f in downloaded_files if f['type'] == 'PDF')
             word_count = sum(1 for f in downloaded_files if f['type'] == 'Word')
@@ -239,6 +323,13 @@ def download_multiple_files(req: func.HttpRequest) -> func.HttpResponse:
                 response_text += f"    🔗 Source: {urlparse(file_info['source_page']).path}\n"
                 total_size += file_info['size']
             response_text += f"\n📦 Total uploaded: {total_size:,} bytes (~{total_size/1024/1024:.2f} MB)\n"
+
+        if skipped_files:
+            response_text += "\n⏭️ Skipped Files (Already Exist Today):\n"
+            for file_info in skipped_files:
+                type_icon = "📄" if file_info['type'] == 'PDF' else "📝"
+                response_text += f"  {type_icon} {file_info['filename']} → {file_info['existing_file']}\n"
+                response_text += f"    📝 {file_info['text'][:50]}{'...' if len(file_info['text']) > 50 else ''}\n"
 
         if failed_downloads:
             response_text += "\n❌ Failed Uploads:\n"
