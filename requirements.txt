@@ -3,6 +3,9 @@
 # Manually managing azure-functions-worker may cause unexpected issues
 
 azure-functions
+azure-functions-durable
 requests
 beautifulsoup4
 azure-storage-blob==12.20.0
+azure-identity
+azure-keyvault-secrets
