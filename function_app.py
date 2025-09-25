@@ -219,15 +219,14 @@ def discover_website_structure(crawl_state: dict) -> dict:
     crawl_summary = []
     documents_by_webpage = {}
     
-    # Add limits to prevent infinite crawling
-    MAX_PAGES = 100  # Limit to 100 pages to prevent getting stuck
-    MAX_TIME_MINUTES = 10  # Limit crawl time to 10 minutes
+    # Add time limit to prevent infinite crawling, but no page limit for unlimited crawling
+    MAX_TIME_MINUTES = 30  # Increased time limit to 30 minutes for comprehensive crawling
     start_time = time.time()
 
-    logging.info(f"Starting comprehensive crawl at {target_url} (max pages: {MAX_PAGES}, max time: {MAX_TIME_MINUTES} min)")
+    logging.info(f"Starting unlimited crawl at {target_url} (max time: {MAX_TIME_MINUTES} min, no page limit)")
     
     page_count = 0
-    while urls_to_visit and page_count < MAX_PAGES:
+    while urls_to_visit:  # Removed page count limit for unlimited crawling
         # Check time limit
         elapsed_minutes = (time.time() - start_time) / 60
         if elapsed_minutes > MAX_TIME_MINUTES:
@@ -298,12 +297,28 @@ def discover_website_structure(crawl_state: dict) -> dict:
                 'navigation_links': len(page_navigation_links)
             })
             
-            # Group documents by source webpage
+            # Group documents by source webpage AND upload them immediately
             if page_document_links:
                 if current_url not in documents_by_webpage:
                     documents_by_webpage[current_url] = []
                 documents_by_webpage[current_url].extend(page_document_links)
                 logging.info(f"Found {len(page_document_links)} documents on {current_url}")
+                
+                # IMMEDIATE UPLOAD: Process and upload documents as soon as they're found
+                try:
+                    webpage_data = {
+                        "webpage_url": current_url,
+                        "documents": page_document_links,
+                        "metadata": {
+                            "crawl_timestamp": datetime.now().isoformat(),
+                            "page_depth": depth,
+                            "page_count": page_count
+                        }
+                    }
+                    upload_result = process_webpage_documents_immediate(webpage_data)
+                    logging.info(f"✅ Immediately uploaded {len(page_document_links)} documents from {current_url}")
+                except Exception as upload_error:
+                    logging.error(f"❌ Failed to upload documents from {current_url}: {upload_error}")
 
             time.sleep(0.2)  # Shorter delay for faster crawling
 
@@ -410,6 +425,207 @@ def detect_content_changes(detection_data: dict) -> dict:
         "webpages_to_process": webpages_to_process,
         "unchanged_webpages": unchanged_webpages,
         "total_webpages": len(documents_by_webpage)
+    }
+
+# Immediate upload function (called directly, not as activity trigger)
+def process_webpage_documents_immediate(webpage_data: dict) -> dict:
+    """Immediately process and upload documents from a webpage (called inline during crawling)."""
+    webpage_url = webpage_data["webpage_url"]
+    documents = webpage_data["documents"]
+    metadata = webpage_data.get("metadata", {})
+    
+    # Create safe folder name from URL
+    def create_safe_folder_name(url):
+        parsed_url = urlparse(url)
+        path_parts = [part for part in parsed_url.path.strip('/').split('/') if part]
+        if path_parts:
+            folder_name = path_parts[-1][:30]  # Last part of path, limited to 30 chars
+        else:
+            folder_name = parsed_url.netloc.replace('.', '_').replace('-', '_')[:30]
+        
+        safe_folder = ''.join(c for c in folder_name if c.isalnum() or c == '_')
+        return safe_folder or "webpage"
+    
+    webpage_folder = create_safe_folder_name(webpage_url)
+    
+    logging.info(f"🚀 IMMEDIATE PROCESSING: {len(documents)} documents from {webpage_url}")
+    
+    # Initialize Azure Blob Storage client
+    blob_container_client = None
+    try:
+        account_name = get_secret_from_keyvault("AzureStorageAccountName")
+        container_name = get_secret_from_keyvault("AzureStorageContainerName")
+        
+        if account_name and container_name:
+            try:
+                credential = DefaultAzureCredential()
+                blob_service_client = BlobServiceClient(
+                    account_url=f"https://{account_name}.blob.core.windows.net",
+                    credential=credential
+                )
+                blob_container_client = blob_service_client.get_container_client(container_name)
+                logging.info(f"Azure Storage ready for immediate upload")
+            except Exception as auth_error:
+                logging.error(f"Azure AD auth failed for immediate upload: {str(auth_error)}")
+                blob_container_client = None
+        else:
+            logging.warning("No Azure Storage config - using local storage for immediate upload")
+                
+    except Exception as e:
+        logging.error(f"Storage init failed for immediate upload: {str(e)}")
+    
+    # Session for downloading documents
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+    
+    # Get current date for folder structure
+    current_date = datetime.now()
+    date_folder = current_date.strftime("%Y-%m-%d")
+    
+    downloaded_files = []
+    failed_downloads = []
+    uploaded_hashes = set()
+    
+    # Process each document immediately
+    for i, doc_info in enumerate(documents):
+        try:
+            download_url = doc_info['url']
+            response = session.get(download_url, timeout=15)  # Shorter timeout for immediate processing
+
+            if response.status_code != 200 or len(response.content) < 1000:
+                session.headers.update({'Referer': webpage_url})
+                response = session.get(download_url, timeout=15)
+
+            if response.status_code == 200 and len(response.content) > 1000:
+                # De-duplication by hash
+                content_hash = hashlib.sha256(response.content).hexdigest()
+                if content_hash in uploaded_hashes:
+                    continue
+                
+                ext = ".pdf" if doc_info['type'] == 'PDF' else (".docx" if 'docx' in download_url else ".doc")
+                unique_id = int(time.time() * 1000)
+                document_sequence = i + 1
+                
+                safe_text = ''.join(c for c in doc_info['text'][:50] if c.isalnum() or c in ' -_').strip().replace(' ', '_')
+                filename = f"{safe_text}_{unique_id}_{document_sequence}{ext}" if safe_text else f"document_{unique_id}_{document_sequence}{ext}"
+                
+                uploaded_hashes.add(content_hash)
+                blob_path = f"{date_folder}/{webpage_folder}/attachment/{filename}"
+
+                # Upload immediately
+                if blob_container_client:
+                    try:
+                        blob_client = blob_container_client.get_blob_client(blob_path)
+                        blob_client.upload_blob(
+                            response.content, 
+                            overwrite=True,
+                            content_settings=ContentSettings(content_type='application/pdf' if ext == '.pdf' else 'application/octet-stream')
+                        )
+                        logging.info(f"⚡ IMMEDIATE UPLOAD: {filename} ({len(response.content)} bytes)")
+                    except Exception as upload_error:
+                        logging.error(f"❌ Immediate upload failed for {filename}: {str(upload_error)}")
+                else:
+                    # Local save
+                    try:
+                        local_path = os.path.join("downloads", blob_path)
+                        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                        with open(local_path, 'wb') as f:
+                            f.write(response.content)
+                        logging.info(f"⚡ IMMEDIATE SAVE: {filename} to local storage")
+                    except Exception as local_error:
+                        logging.error(f"❌ Immediate local save failed: {str(local_error)}")
+
+                downloaded_files.append({
+                    'filename': filename,
+                    'size': len(response.content),
+                    'url': download_url,
+                    'type': doc_info['type'],
+                    'blob_path': blob_path
+                })
+
+            else:
+                failed_downloads.append({
+                    'url': download_url,
+                    'status': response.status_code,
+                    'size': len(response.content) if response.content else 0
+                })
+
+        except Exception as e:
+            failed_downloads.append({
+                'url': doc_info['url'],
+                'error': str(e)
+            })
+    
+    # Create webpage JSON metadata file if documents were processed
+    webpage_json_result = None
+    if downloaded_files:
+        try:
+            unique_id = int(time.time() * 1000)
+            json_filename = f"webpage_{unique_id}.json"
+            json_blob_path = f"{date_folder}/{webpage_folder}/webpage/{json_filename}"
+            
+            # Create JSON content with the same structure as the original
+            json_content = {
+                'webpage_url': webpage_url,
+                'unique_id': unique_id,
+                'crawl_date': current_date.isoformat(),
+                'total_documents': len(downloaded_files),
+                'metadata': metadata,  # Include the crawl metadata (depth, page count, etc.)
+                'documents': [
+                    {
+                        'filename': file_info['filename'],
+                        'display_name': file_info['filename'],
+                        'original_text': documents[i].get('text', '') if i < len(documents) else '',
+                        'type': file_info['type'],
+                        'size': file_info['size'],
+                        'download_url': file_info['url'],
+                        'blob_path': file_info['blob_path']
+                    }
+                    for i, file_info in enumerate(downloaded_files)
+                ]
+            }
+            
+            # Upload JSON metadata to Azure Storage or save locally
+            json_data = json.dumps(json_content, indent=2)
+            
+            if blob_container_client:
+                try:
+                    # Upload JSON to Azure Storage
+                    json_blob_client = blob_container_client.get_blob_client(json_blob_path)
+                    json_blob_client.upload_blob(
+                        json_data.encode('utf-8'), 
+                        overwrite=True,
+                        content_settings=ContentSettings(content_type='application/json')
+                    )
+                    logging.info(f"⚡ IMMEDIATE JSON UPLOAD: {json_filename} to {json_blob_path}")
+                    webpage_json_result = {'status': 'uploaded', 'path': json_blob_path}
+                except Exception as json_upload_error:
+                    logging.error(f"❌ Immediate JSON upload failed for {json_filename}: {str(json_upload_error)}")
+                    webpage_json_result = {'status': 'failed', 'error': str(json_upload_error)}
+            else:
+                # Save JSON to local file system
+                try:
+                    json_local_path = os.path.join("downloads", json_blob_path)
+                    os.makedirs(os.path.dirname(json_local_path), exist_ok=True)
+                    
+                    with open(json_local_path, 'w', encoding='utf-8') as f:
+                        f.write(json_data)
+                    logging.info(f"⚡ IMMEDIATE JSON SAVE: {json_filename} to {json_local_path}")
+                    webpage_json_result = {'status': 'saved_locally', 'path': json_local_path}
+                except Exception as json_local_error:
+                    logging.error(f"❌ Immediate JSON local save failed for {json_filename}: {str(json_local_error)}")
+                    webpage_json_result = {'status': 'failed', 'error': str(json_local_error)}
+                    
+        except Exception as json_error:
+            logging.error(f"❌ JSON metadata creation failed: {str(json_error)}")
+            webpage_json_result = {'status': 'failed', 'error': str(json_error)}
+    
+    return {
+        'webpage_url': webpage_url,
+        'downloaded_files': downloaded_files,
+        'failed_downloads': failed_downloads,
+        'webpage_json_result': webpage_json_result,
+        'immediate_upload': True
     }
 
 # Activity Function 3: Process webpage documents
