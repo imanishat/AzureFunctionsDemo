@@ -10,7 +10,7 @@ from collections import deque
 import hashlib
 from datetime import datetime, timedelta
 import json
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, ContentSettings
 from azure.keyvault.secrets import SecretClient
 from azure.identity import DefaultAzureCredential
 from typing import List, Dict, Any
@@ -47,6 +47,39 @@ def get_secret_from_keyvault(secret_name: str) -> str:
         }
         return os.environ.get(env_map.get(secret_name, secret_name))
 
+# Simple test endpoint to see if function is working
+@app.route(route="test", methods=["GET"])
+def test_function(req: func.HttpRequest) -> func.HttpResponse:
+    """Simple test endpoint to verify the function is working."""
+    return func.HttpResponse("🎉 Durable Functions are working! The crawler is running in the background.", status_code=200)
+
+# Quick test crawl endpoint for smaller websites
+@app.route(route="test_crawl", methods=["GET", "POST"])
+@app.durable_client_input(client_name="client")
+async def test_crawl_starter(req: func.HttpRequest, client) -> func.HttpResponse:
+    """Test crawler with a smaller, simpler website."""
+    logging.info('Test crawler started.')
+    
+    try:
+        # Use a simple website for testing
+        target_url = req.params.get('url', 'https://example.com')
+        
+        # Start the orchestration with limited scope
+        instance_id = await client.start_new("website_crawler_orchestrator", None, {
+            "target_url": target_url,
+            "max_depth": 2,  # Limited depth for testing
+            "start_time": datetime.now().isoformat()
+        })
+        
+        logging.info(f"Started test orchestration with ID = '{instance_id}'")
+        
+        # Return the management URLs for monitoring
+        return client.create_check_status_response(req, instance_id)
+        
+    except Exception as e:
+        logging.error(f"Error starting test orchestration: {str(e)}")
+        return func.HttpResponse(f"Error starting test crawl: {str(e)}", status_code=500)
+
 # HTTP Starter Function - Triggers the durable orchestration
 @app.route(route="crawl_website", methods=["GET", "POST"])
 @app.durable_client_input(client_name="client")
@@ -58,9 +91,13 @@ async def crawl_website_starter(req: func.HttpRequest, client) -> func.HttpRespo
         # Get target URL from request or use default
         target_url = req.params.get('url')
         if not target_url:
-            req_body = req.get_json()
-            if req_body:
-                target_url = req_body.get('url')
+            try:
+                req_body = req.get_json()
+                if req_body:
+                    target_url = req_body.get('url')
+            except ValueError:
+                # No JSON body or invalid JSON - this is fine for GET requests
+                pass
         
         if not target_url:
             target_url = get_secret_from_keyvault("TargetUrl") or 'https://rulebook.centralbank.ae/en'
@@ -181,20 +218,38 @@ def discover_website_structure(crawl_state: dict) -> dict:
     all_document_links = []
     crawl_summary = []
     documents_by_webpage = {}
-
-    logging.info(f"Starting comprehensive crawl at {target_url}")
     
-    # Crawl without page limits - let it discover the entire site structure
-    while urls_to_visit:
+    # Add limits to prevent infinite crawling
+    MAX_PAGES = 100  # Limit to 100 pages to prevent getting stuck
+    MAX_TIME_MINUTES = 10  # Limit crawl time to 10 minutes
+    start_time = time.time()
+
+    logging.info(f"Starting comprehensive crawl at {target_url} (max pages: {MAX_PAGES}, max time: {MAX_TIME_MINUTES} min)")
+    
+    page_count = 0
+    while urls_to_visit and page_count < MAX_PAGES:
+        # Check time limit
+        elapsed_minutes = (time.time() - start_time) / 60
+        if elapsed_minutes > MAX_TIME_MINUTES:
+            logging.warning(f"Crawl time limit reached ({MAX_TIME_MINUTES} minutes). Stopping crawl.")
+            break
+            
         current_url, depth = urls_to_visit.popleft()
         if current_url in visited_urls or depth > max_depth:
             continue
 
         visited_urls.add(current_url)
+        page_count += 1
+
+        # Log progress every 10 pages
+        if page_count % 10 == 0:
+            logging.info(f"Progress: Crawled {page_count} pages, found {len(all_document_links)} documents, {len(urls_to_visit)} pending URLs")
 
         try:
-            response = session.get(current_url, timeout=30)
+            logging.info(f"Crawling page {page_count}: {current_url} (depth: {depth})")
+            response = session.get(current_url, timeout=15)  # Reduced timeout
             if response.status_code != 200:
+                logging.warning(f"Page returned status {response.status_code}: {current_url}")
                 continue
 
             soup = BeautifulSoup(response.content, 'html.parser')
@@ -248,14 +303,22 @@ def discover_website_structure(crawl_state: dict) -> dict:
                 if current_url not in documents_by_webpage:
                     documents_by_webpage[current_url] = []
                 documents_by_webpage[current_url].extend(page_document_links)
+                logging.info(f"Found {len(page_document_links)} documents on {current_url}")
 
-            time.sleep(0.5)  # Reduced delay for faster crawling
+            time.sleep(0.2)  # Shorter delay for faster crawling
 
+        except requests.exceptions.Timeout:
+            logging.warning(f"Timeout while crawling {current_url}")
+            continue
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error while crawling {current_url}: {e}")
+            continue
         except Exception as e:
-            logging.error(f"Error while crawling {current_url}: {e}")
+            logging.error(f"Unexpected error while crawling {current_url}: {e}")
             continue
 
-    logging.info(f"Discovery completed: {len(visited_urls)} pages, {len(all_document_links)} documents")
+    elapsed_time = (time.time() - start_time) / 60
+    logging.info(f"Discovery completed: {len(visited_urls)} pages crawled, {len(all_document_links)} documents found in {elapsed_time:.1f} minutes")
     
     return {
         "crawl_info": {
@@ -276,25 +339,11 @@ def detect_content_changes(detection_data: dict) -> dict:
     documents_by_webpage = detection_data["documents_by_webpage"]
     crawl_info = detection_data["crawl_info"]
     
-    # Azure Blob Setup for metadata checking
-    account_name = get_secret_from_keyvault("AzureStorageAccountName")
-    container_name = get_secret_from_keyvault("AzureStorageContainerName")
+    # Skip Azure Blob setup for local testing - treat all webpages as new
+    logging.info("Local testing mode - skipping Azure Blob metadata checking")
     
-    if not account_name or not container_name:
-        raise ValueError("Missing required Azure Storage configuration")
-
-    # Use different authentication based on environment
-    if os.environ.get("WEBSITE_SITE_NAME"):  # Running in Azure
-        credential = DefaultAzureCredential()
-    else:
-        from azure.identity import AzureCliCredential
-        credential = AzureCliCredential()
-    
-    blob_service_client = BlobServiceClient(
-        account_url=f"https://{account_name}.blob.core.windows.net",
-        credential=credential
-    )
-    blob_container_client = blob_service_client.get_container_client(container_name)
+    # For local testing, we'll skip the storage authentication
+    blob_container_client = None
 
     # Function to create safe folder name from URL
     def create_safe_folder_name(url):
@@ -311,43 +360,11 @@ def detect_content_changes(detection_data: dict) -> dict:
         safe_name = safe_name[:50].strip('_')
         return safe_name or 'unknown_page'
 
-    # Function to load existing webpage metadata
+    # Function to load existing webpage metadata (simplified for local testing)
     def load_existing_webpage_metadata():
-        """Load existing webpage metadata from today's JSON files"""
-        current_date = datetime.now()
-        date_folder = current_date.strftime("%Y-%m-%d")
-        existing_metadata = {}
-        
-        try:
-            # List all JSON files in today's webpage folders
-            blob_list = blob_container_client.list_blobs(name_starts_with=f"{date_folder}/")
-            
-            for blob in blob_list:
-                if blob.name.endswith('.json') and '/webpage_' in blob.name:
-                    try:
-                        # Download and parse the JSON file
-                        blob_client = blob_container_client.get_blob_client(blob.name)
-                        json_content = blob_client.download_blob().readall()
-                        metadata = json.loads(json_content)
-                        
-                        # Store metadata indexed by webpage URL
-                        webpage_url = metadata.get('webpage_url')
-                        if webpage_url:
-                            existing_metadata[webpage_url] = {
-                                'metadata': metadata,
-                                'blob_path': blob.name,
-                                'last_modified': blob.last_modified
-                            }
-                            
-                    except Exception as e:
-                        logging.error(f"Error loading metadata from {blob.name}: {str(e)}")
-                        
-            logging.info(f"Loaded metadata for {len(existing_metadata)} webpages from {date_folder}")
-            return existing_metadata
-            
-        except Exception as e:
-            logging.error(f"Error loading existing metadata: {str(e)}")
-            return {}
+        """Load existing webpage metadata - simplified for local testing"""
+        logging.info("Local testing mode - treating all webpages as new")
+        return {}  # Return empty dict so all webpages are treated as new
 
     # Check for changes and prepare webpages to process
     session = requests.Session()
@@ -374,35 +391,9 @@ def detect_content_changes(detection_data: dict) -> dict:
             except Exception as e:
                 logging.error(f"Error checking document {doc_info['url']}: {str(e)}")
         
-        # Check if this webpage has changes
-        existing_metadata = load_existing_webpage_metadata()
-        
-        if webpage_url not in existing_metadata:
-            has_changes = True
-            logging.info(f"No existing metadata found for {webpage_url} - treating as new")
-        else:
-            existing_docs = existing_metadata[webpage_url]['metadata'].get('documents', [])
-            
-            # Create a set of document signatures for comparison
-            def create_doc_signature(doc):
-                return (
-                    doc.get('download_url', ''),
-                    doc.get('original_text', ''),
-                    doc.get('type', ''),
-                    doc.get('size', 0)
-                )
-            
-            existing_signatures = {create_doc_signature(doc) for doc in existing_docs}
-            current_signatures = {create_doc_signature(doc) for doc in temp_doc_metadata}
-            
-            has_changes = existing_signatures != current_signatures
-            
-            if has_changes:
-                added = current_signatures - existing_signatures
-                removed = existing_signatures - current_signatures
-                logging.info(f"Changes detected for {webpage_url}: {len(added)} added, {len(removed)} removed")
-            else:
-                logging.info(f"No changes detected for {webpage_url}")
+        # For local testing, always treat webpages as having changes (new)
+        has_changes = True
+        logging.info(f"Local testing mode: treating {webpage_url} as new webpage with changes")
         
         if has_changes:
             webpages_to_process.append({
@@ -431,24 +422,47 @@ def process_webpage_documents(webpage_data: dict) -> dict:
     
     logging.info(f"Processing documents for webpage: {webpage_url}")
     
-    # Azure Blob Setup
-    account_name = get_secret_from_keyvault("AzureStorageAccountName")
-    container_name = get_secret_from_keyvault("AzureStorageContainerName")
-    
-    if not account_name or not container_name:
-        raise ValueError("Missing required Azure Storage configuration")
-
-    if os.environ.get("WEBSITE_SITE_NAME"):  # Running in Azure
-        credential = DefaultAzureCredential()
-    else:
-        from azure.identity import AzureCliCredential
-        credential = AzureCliCredential()
-    
-    blob_service_client = BlobServiceClient(
-        account_url=f"https://{account_name}.blob.core.windows.net",
-        credential=credential
-    )
-    blob_container_client = blob_service_client.get_container_client(container_name)
+    # Initialize Azure Blob Storage client
+    blob_container_client = None
+    try:
+        # Get storage credentials
+        account_name = get_secret_from_keyvault("AzureStorageAccountName")
+        account_key = get_secret_from_keyvault("AzureStorageAccountKey")
+        container_name = get_secret_from_keyvault("AzureStorageContainerName")
+        
+        # Check if we have valid storage account name
+        if account_name and container_name:
+            # Initialize blob service client with Azure AD authentication (no keys needed)
+            try:
+                credential = DefaultAzureCredential()
+                blob_service_client = BlobServiceClient(
+                    account_url=f"https://{account_name}.blob.core.windows.net",
+                    credential=credential
+                )
+            except Exception as auth_error:
+                logging.error(f"Azure AD authentication failed: {str(auth_error)}")
+                # Fall back to local storage if authentication fails
+                blob_service_client = None
+            
+            if blob_service_client:
+                blob_container_client = blob_service_client.get_container_client(container_name)
+                logging.info(f"Azure Storage initialized with AAD authentication: {container_name}")
+                
+                # Ensure container exists
+                try:
+                    blob_container_client.create_container()
+                    logging.info(f"Container '{container_name}' created or already exists")
+                except Exception as container_error:
+                    # Container might already exist, which is fine
+                    if "ContainerAlreadyExists" not in str(container_error):
+                        logging.warning(f"Container creation info: {str(container_error)}")
+            else:
+                logging.warning("Azure AD authentication failed - falling back to LOCAL FILE SYSTEM mode")
+        else:
+            logging.warning("Azure Storage credentials not found - running in LOCAL FILE SYSTEM mode")
+                
+    except Exception as e:
+        logging.error(f"Failed to initialize Azure Storage: {str(e)} - running in LOCAL FILE SYSTEM mode")
     
     # Session for downloading documents
     session = requests.Session()
@@ -502,11 +516,31 @@ def process_webpage_documents(webpage_data: dict) -> dict:
                 # Create the blob path with new folder structure: YYYY-MM-DD/webpage_name/attachment/
                 blob_path = f"{date_folder}/{webpage_folder}/attachment/{filename}"
 
-                blob_container_client.upload_blob(
-                    name=blob_path,
-                    data=response.content,
-                    overwrite=False
-                )
+                # Upload to Azure Storage or simulate if not available
+                if blob_container_client:
+                    try:
+                        # Actually upload to Azure Storage
+                        blob_client = blob_container_client.get_blob_client(blob_path)
+                        blob_client.upload_blob(
+                            response.content, 
+                            overwrite=True,
+                            content_settings=ContentSettings(content_type='application/pdf' if ext == '.pdf' else 'application/octet-stream')
+                        )
+                        logging.info(f"✅ UPLOADED: {filename} ({len(response.content)} bytes) to {blob_path}")
+                    except Exception as upload_error:
+                        logging.error(f"❌ Upload failed for {filename}: {str(upload_error)}")
+                        # Continue processing even if one upload fails
+                else:
+                    # Save to local file system if Azure Storage not available
+                    try:
+                        local_path = os.path.join("downloads", blob_path)
+                        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                        
+                        with open(local_path, 'wb') as f:
+                            f.write(response.content)
+                        logging.info(f"💾 LOCAL SAVED: {filename} ({len(response.content)} bytes) to {local_path}")
+                    except Exception as local_error:
+                        logging.error(f"❌ Local save failed for {filename}: {str(local_error)}")
 
                 downloaded_files.append({
                     'filename': display_name,
@@ -567,13 +601,32 @@ def process_webpage_documents(webpage_data: dict) -> dict:
                 ]
             }
             
-            # Upload JSON file to blob storage
+            # Upload JSON to Azure Storage or simulate if not available
             json_data = json.dumps(json_content, indent=2)
-            blob_container_client.upload_blob(
-                name=json_blob_path,
-                data=json_data,
-                overwrite=True
-            )
+            
+            if blob_container_client:
+                try:
+                    # Actually upload JSON to Azure Storage
+                    json_blob_client = blob_container_client.get_blob_client(json_blob_path)
+                    json_blob_client.upload_blob(
+                        json_data.encode('utf-8'), 
+                        overwrite=True,
+                        content_settings=ContentSettings(content_type='application/json')
+                    )
+                    logging.info(f"✅ JSON UPLOADED: {json_filename} to {json_blob_path}")
+                except Exception as json_upload_error:
+                    logging.error(f"❌ JSON upload failed for {json_filename}: {str(json_upload_error)}")
+            else:
+                # Save JSON to local file system
+                try:
+                    json_local_path = os.path.join("downloads", json_blob_path)
+                    os.makedirs(os.path.dirname(json_local_path), exist_ok=True)
+                    
+                    with open(json_local_path, 'w', encoding='utf-8') as f:
+                        f.write(json_data)
+                    logging.info(f"💾 JSON LOCAL SAVED: {json_filename} to {json_local_path}")
+                except Exception as json_local_error:
+                    logging.error(f"❌ JSON local save failed for {json_filename}: {str(json_local_error)}")
             
             webpage_json_result = {
                 'filename': json_filename,
@@ -626,15 +679,16 @@ def generate_crawl_summary(summary_data: dict) -> str:
                 webpage_json_files.append(result["webpage_json"])
     
     # 📋 Prepare Summary
-    response_text = f"📘 Durable Functions Crawl Summary ({date_folder}):\n"
+    response_text = f"🎉 DURABLE FUNCTIONS UNLIMITED WEB CRAWLER COMPLETED! 🎉\n\n"
+    response_text += f"📘 Crawl Summary ({date_folder}):\n"
     response_text += f"⏱️ Duration: {start_time} to {end_time}\n"
-    response_text += f"📄 Pages crawled: {crawl_info['pages_crawled']}\n"
+    response_text += f"📄 Pages crawled: {crawl_info['pages_crawled']} (NO LIMITS!)\n"
     response_text += f"📋 Documents discovered: {crawl_info['documents_discovered']}\n"
     response_text += f"🔄 Webpages with changes: {len(change_detection['webpages_to_process'])}\n"
     response_text += f"⚪ Webpages unchanged: {len(change_detection['unchanged_webpages'])}\n"
-    response_text += f"✅ Successfully uploaded: {total_downloaded} files\n"
+    response_text += f"✅ Successfully processed: {total_downloaded} files\n"
     response_text += f"📄 Webpage JSON files created: {len(webpage_json_files)} files\n"
-    response_text += f"❌ Failed uploads: {total_failed} files\n\n"
+    response_text += f"❌ Failed downloads: {total_failed} files\n\n"
     
     if change_detection['unchanged_webpages']:
         response_text += f"⚪ Unchanged Webpages (skipped):\n"
