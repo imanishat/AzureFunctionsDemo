@@ -47,6 +47,76 @@ def get_secret_from_keyvault(secret_name: str) -> str:
         }
         return os.environ.get(env_map.get(secret_name, secret_name))
 
+def get_existing_file_hashes_for_date(blob_container_client, date_folder: str) -> Dict[str, str]:
+    """Get existing file hashes from storage for the current date only to prevent duplicates within the same day"""
+    existing_hashes = {}
+    try:
+        if blob_container_client:
+            # List only PDF and document files in the current date folder
+            blob_list = blob_container_client.list_blobs(name_starts_with=f"{date_folder}/")
+            for blob in blob_list:
+                if blob.name.lower().endswith(('.pdf', '.doc', '.docx')):
+                    # Get content hash from blob metadata or calculate it
+                    try:
+                        blob_client = blob_container_client.get_blob_client(blob.name)
+                        properties = blob_client.get_blob_properties()
+                        
+                        # Try to get hash from metadata first
+                        if properties.metadata and 'content_hash' in properties.metadata:
+                            content_hash = properties.metadata['content_hash']
+                        else:
+                            # Download and calculate hash if not in metadata
+                            blob_data = blob_client.download_blob().readall()
+                            content_hash = hashlib.sha256(blob_data).hexdigest()
+                            
+                            # Update blob metadata with hash for future reference
+                            try:
+                                blob_client.set_blob_metadata({'content_hash': content_hash})
+                            except:
+                                pass  # Ignore metadata update errors
+                        
+                        existing_hashes[content_hash] = blob.name
+                        
+                    except Exception as e:
+                        logging.warning(f"Could not get hash for {blob.name}: {str(e)}")
+                        continue
+                        
+        logging.info(f"Found {len(existing_hashes)} existing files with hashes in current date folder: {date_folder}")
+        return existing_hashes
+        
+    except Exception as e:
+        logging.error(f"Error getting existing file hashes for date {date_folder}: {str(e)}")
+        return {}
+
+
+def check_duplicate_by_name_pattern_for_date(filename: str, blob_container_client, date_folder: str) -> bool:
+    """Check if a file with similar name pattern already exists in the current date folder"""
+    try:
+        if not blob_container_client:
+            return False
+            
+        # Extract the base text from filename (before timestamp and sequence)
+        base_name = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+        
+        if len(base_name) < 5:  # Skip very short names
+            return False
+            
+        # List blobs only in the current date folder and check for similar names
+        blob_list = blob_container_client.list_blobs(name_starts_with=f"{date_folder}/")
+        for blob in blob_list:
+            if blob.name.lower().endswith(('.pdf', '.doc', '.docx')):
+                blob_base_name = blob.name.split('/')[-1].split('_')[0] if '_' in blob.name else blob.name.split('/')[-1].split('.')[0]
+                if blob_base_name.lower() == base_name.lower():
+                    logging.info(f"Found similar filename in {date_folder}: {blob.name} matches pattern for {filename}")
+                    return True
+                    
+        return False
+        
+    except Exception as e:
+        logging.warning(f"Error checking duplicate by name for date {date_folder}: {str(e)}")
+        return False
+
+
 # Simple test endpoint to see if function is working
 @app.route(route="test", methods=["GET"])
 def test_function(req: func.HttpRequest) -> func.HttpResponse:
@@ -219,20 +289,10 @@ def discover_website_structure(crawl_state: dict) -> dict:
     crawl_summary = []
     documents_by_webpage = {}
     
-    # Add time limit to prevent infinite crawling, but no page limit for unlimited crawling
-    MAX_TIME_MINUTES = 30  # Increased time limit to 30 minutes for comprehensive crawling
-    start_time = time.time()
-
-    logging.info(f"Starting unlimited crawl at {target_url} (max time: {MAX_TIME_MINUTES} min, no page limit)")
+    logging.info(f"Starting unlimited crawl at {target_url} (no time or page limits)")
     
     page_count = 0
-    while urls_to_visit:  # Removed page count limit for unlimited crawling
-        # Check time limit
-        elapsed_minutes = (time.time() - start_time) / 60
-        if elapsed_minutes > MAX_TIME_MINUTES:
-            logging.warning(f"Crawl time limit reached ({MAX_TIME_MINUTES} minutes). Stopping crawl.")
-            break
-            
+    while urls_to_visit:  # Completely unlimited crawling - will continue until all pages are crawled            
         current_url, depth = urls_to_visit.popleft()
         if current_url in visited_urls or depth > max_depth:
             continue
@@ -332,8 +392,7 @@ def discover_website_structure(crawl_state: dict) -> dict:
             logging.error(f"Unexpected error while crawling {current_url}: {e}")
             continue
 
-    elapsed_time = (time.time() - start_time) / 60
-    logging.info(f"Discovery completed: {len(visited_urls)} pages crawled, {len(all_document_links)} documents found in {elapsed_time:.1f} minutes")
+    logging.info(f"Discovery completed: {len(visited_urls)} pages crawled, {len(all_document_links)} documents found")
     
     return {
         "crawl_info": {
@@ -484,7 +543,10 @@ def process_webpage_documents_immediate(webpage_data: dict) -> dict:
     
     downloaded_files = []
     failed_downloads = []
-    uploaded_hashes = set()
+    
+    # Get existing file hashes from storage for current date only (scoped deduplication)
+    existing_hashes = get_existing_file_hashes_for_date(blob_container_client, date_folder)
+    current_session_hashes = set()  # Track hashes for current session
     
     # Process each document immediately
     for i, doc_info in enumerate(documents):
@@ -497,9 +559,17 @@ def process_webpage_documents_immediate(webpage_data: dict) -> dict:
                 response = session.get(download_url, timeout=15)
 
             if response.status_code == 200 and len(response.content) > 1000:
-                # De-duplication by hash
+                # Calculate content hash for date-scoped deduplication
                 content_hash = hashlib.sha256(response.content).hexdigest()
-                if content_hash in uploaded_hashes:
+                
+                # Check for duplicates in existing storage (current date only)
+                if content_hash in existing_hashes:
+                    logging.info(f"⏭️ DUPLICATE DETECTED: Content already exists in {date_folder} as {existing_hashes[content_hash]}")
+                    continue
+                
+                # Check for duplicates in current session
+                if content_hash in current_session_hashes:
+                    logging.info(f"⏭️ DUPLICATE DETECTED: Content already processed in current session")
                     continue
                 
                 ext = ".pdf" if doc_info['type'] == 'PDF' else (".docx" if 'docx' in download_url else ".doc")
@@ -509,7 +579,12 @@ def process_webpage_documents_immediate(webpage_data: dict) -> dict:
                 safe_text = ''.join(c for c in doc_info['text'][:50] if c.isalnum() or c in ' -_').strip().replace(' ', '_')
                 filename = f"{safe_text}_{unique_id}_{document_sequence}{ext}" if safe_text else f"document_{unique_id}_{document_sequence}{ext}"
                 
-                uploaded_hashes.add(content_hash)
+                # Additional check for similar filenames within current date folder
+                if check_duplicate_by_name_pattern_for_date(filename, blob_container_client, date_folder):
+                    logging.info(f"⏭️ DUPLICATE DETECTED: Similar filename pattern already exists in {date_folder} for {filename}")
+                    continue
+                
+                current_session_hashes.add(content_hash)
                 blob_path = f"{date_folder}/{webpage_folder}/attachment/{filename}"
 
                 # Upload immediately
@@ -519,9 +594,14 @@ def process_webpage_documents_immediate(webpage_data: dict) -> dict:
                         blob_client.upload_blob(
                             response.content, 
                             overwrite=True,
-                            content_settings=ContentSettings(content_type='application/pdf' if ext == '.pdf' else 'application/octet-stream')
+                            content_settings=ContentSettings(content_type='application/pdf' if ext == '.pdf' else 'application/octet-stream'),
+                            metadata={'content_hash': content_hash, 'source_url': download_url, 'processed_date': datetime.now().isoformat()}
                         )
-                        logging.info(f"⚡ IMMEDIATE UPLOAD: {filename} ({len(response.content)} bytes)")
+                        logging.info(f"⚡ IMMEDIATE UPLOAD: {filename} ({len(response.content)} bytes) with hash {content_hash[:8]}...")
+                        
+                        # Update existing hashes to prevent duplicates in same session
+                        existing_hashes[content_hash] = blob_path
+                        
                     except Exception as upload_error:
                         logging.error(f"❌ Immediate upload failed for {filename}: {str(upload_error)}")
                 else:
@@ -531,7 +611,7 @@ def process_webpage_documents_immediate(webpage_data: dict) -> dict:
                         os.makedirs(os.path.dirname(local_path), exist_ok=True)
                         with open(local_path, 'wb') as f:
                             f.write(response.content)
-                        logging.info(f"⚡ IMMEDIATE SAVE: {filename} to local storage")
+                        logging.info(f"⚡ IMMEDIATE SAVE: {filename} to local storage with hash {content_hash[:8]}...")
                     except Exception as local_error:
                         logging.error(f"❌ Immediate local save failed: {str(local_error)}")
 
@@ -693,7 +773,10 @@ def process_webpage_documents(webpage_data: dict) -> dict:
     # Track results
     downloaded_files = []
     failed_downloads = []
-    uploaded_hashes = set()
+    
+    # Get existing file hashes from storage for current date only (scoped deduplication)
+    existing_hashes = get_existing_file_hashes_for_date(blob_container_client, date_folder)
+    current_session_hashes = set()  # Track hashes for current session
     
     # Process each document
     for i, doc_info in enumerate(documents):
@@ -706,9 +789,17 @@ def process_webpage_documents(webpage_data: dict) -> dict:
                 response = session.get(download_url, timeout=30)
 
             if response.status_code == 200 and len(response.content) > 1000:
-                # De-duplication by hash
+                # Calculate content hash for date-scoped deduplication
                 content_hash = hashlib.sha256(response.content).hexdigest()
-                if content_hash in uploaded_hashes:
+                
+                # Check for duplicates in existing storage (current date only)
+                if content_hash in existing_hashes:
+                    logging.info(f"⏭️ DUPLICATE DETECTED: Content already exists in {date_folder} as {existing_hashes[content_hash]}")
+                    continue
+                
+                # Check for duplicates in current session
+                if content_hash in current_session_hashes:
+                    logging.info(f"⏭️ DUPLICATE DETECTED: Content already processed in current session")
                     continue
                 
                 ext = ".pdf" if doc_info['type'] == 'PDF' else (".docx" if 'docx' in download_url else ".doc")
@@ -727,7 +818,12 @@ def process_webpage_documents(webpage_data: dict) -> dict:
                     filename = f"document_{unique_id}_{document_sequence}{ext}"
                     display_name = f"document_{unique_id}_{document_sequence}{ext}"
                 
-                uploaded_hashes.add(content_hash)
+                # Additional check for similar filenames within current date folder
+                if check_duplicate_by_name_pattern_for_date(filename, blob_container_client, date_folder):
+                    logging.info(f"⏭️ DUPLICATE DETECTED: Similar filename pattern already exists in {date_folder} for {filename}")
+                    continue
+                
+                current_session_hashes.add(content_hash)
                 
                 # Create the blob path with new folder structure: YYYY-MM-DD/webpage_name/attachment/
                 blob_path = f"{date_folder}/{webpage_folder}/attachment/{filename}"
@@ -740,9 +836,14 @@ def process_webpage_documents(webpage_data: dict) -> dict:
                         blob_client.upload_blob(
                             response.content, 
                             overwrite=True,
-                            content_settings=ContentSettings(content_type='application/pdf' if ext == '.pdf' else 'application/octet-stream')
+                            content_settings=ContentSettings(content_type='application/pdf' if ext == '.pdf' else 'application/octet-stream'),
+                            metadata={'content_hash': content_hash, 'source_url': download_url, 'processed_date': datetime.now().isoformat()}
                         )
-                        logging.info(f"✅ UPLOADED: {filename} ({len(response.content)} bytes) to {blob_path}")
+                        logging.info(f"✅ UPLOADED: {filename} ({len(response.content)} bytes) to {blob_path} with hash {content_hash[:8]}...")
+                        
+                        # Update existing hashes to prevent duplicates in same session
+                        existing_hashes[content_hash] = blob_path
+                        
                     except Exception as upload_error:
                         logging.error(f"❌ Upload failed for {filename}: {str(upload_error)}")
                         # Continue processing even if one upload fails
